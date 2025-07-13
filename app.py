@@ -6,631 +6,523 @@ import tempfile
 from datetime import datetime
 from typing import Dict, List, Any, Optional
 import traceback
-import sys
+import re
+from query_generator_evaluator import run_sql_agent
 
-# Check for required dependencies and provide helpful error messages
+# Check for required dependencies
 try:
     import pandasql as ps
 except ImportError:
-    st.error("""
-    ❌ **Missing Required Package: pandasql**
-    
-    Please install the missing package by running:
-    ```bash
-    pip install pandasql
-    ```
-    
-    Or install all requirements:
-    ```bash
-    pip install -r requirements.txt
-    ```
-    """)
+    st.error("Missing Required Package: pandasql. Please install with: pip install pandasql")
     st.stop()
 
-# Import your existing modules with error handling
+# Import modules with error handling
 try:
     from models import Qwen, Meta
-    from qeury_generator_evaluator import run_sql_agent, get_csv_schema, SQLAgentState
+    from query_generator_evaluator import run_sql_agent, get_csv_schema, SQLAgentState
 except ImportError as e:
-    st.error(f"""
-    ❌ **Import Error**
-    
-    Could not import required modules: {str(e)}
-    
-    Please ensure:
-    1. `models.py` and `qg2.py` are in the same directory as this app
-    2. All dependencies are installed: `pip install -r requirements.txt`
-    3. No syntax errors in the imported files
-    """)
-    st.stop()
-except Exception as e:
-    st.error(f"""
-    ❌ **Module Loading Error**
-    
-    Error loading modules: {str(e)}
-    
-    Please check:
-    1. All required packages are installed
-    2. API keys are properly configured
-    3. No circular imports exist
-    
-    Full error: {traceback.format_exc()}
-    """)
+    st.error(f"Import Error: {str(e)}. Please ensure all files are in the correct directory.")
     st.stop()
 
 # Configure Streamlit page
 st.set_page_config(
     page_title="SQL Query Generator",
     page_icon="🔍",
-    layout="wide",
-    initial_sidebar_state="expanded"
+    layout="wide"
 )
-
-# Add custom CSS for better styling and copy functionality
-st.markdown("""
-<style>
-.copy-button {
-    position: relative;
-    display: inline-block;
-    margin-top: 5px;
-}
-
-.copy-text {
-    background-color: #f0f2f6;
-    border: 1px solid #ddd;
-    border-radius: 4px;
-    padding: 10px;
-    font-family: monospace;
-    white-space: pre-wrap;
-    word-wrap: break-word;
-    max-height: 200px;
-    overflow-y: auto;
-}
-
-.stAlert > div {
-    padding: 1rem;
-}
-
-.schema-info {
-    background-color: #f8f9fa;
-    border-left: 4px solid #007bff;
-    padding: 10px;
-    margin: 10px 0;
-}
-
-.query-result {
-    background-color: #e8f5e8;
-    border: 1px solid #4caf50;
-    border-radius: 4px;
-    padding: 10px;
-    margin: 10px 0;
-}
-
-.error-result {
-    background-color: #ffebee;
-    border: 1px solid #f44336;
-    border-radius: 4px;
-    padding: 10px;
-    margin: 10px 0;
-}
-</style>
-
-<script>
-function copyToClipboard(text) {
-    navigator.clipboard.writeText(text).then(function() {
-        // Show success message
-        const button = event.target;
-        const originalText = button.innerHTML;
-        button.innerHTML = '✅ Copied!';
-        setTimeout(() => {
-            button.innerHTML = originalText;
-        }, 2000);
-    });
-}
-</script>
-""", unsafe_allow_html=True)
 
 # Initialize session state
 def initialize_session_state():
-    """Initialize session state variables"""
-    if 'prompt_history' not in st.session_state:
-        st.session_state.prompt_history = []
-    if 'uploaded_file_path' not in st.session_state:
-        st.session_state.uploaded_file_path = None
-    if 'uploaded_file_name' not in st.session_state:
-        st.session_state.uploaded_file_name = None
-    if 'schema_info' not in st.session_state:
-        st.session_state.schema_info = None
-    if 'query_results' not in st.session_state:
-        st.session_state.query_results = None
-    if 'saved_prompts' not in st.session_state:
-        st.session_state.saved_prompts = load_saved_prompts()
-    if 'current_dataframe' not in st.session_state:
-        st.session_state.current_dataframe = None
-    if 'detailed_schema' not in st.session_state:
-        st.session_state.detailed_schema = None
+    default_values = {
+        'prompt_history': [],
+        'uploaded_file_path': None,
+        'uploaded_file_name': None,
+        'clean_file_name': None,  # Added for clean filename
+        'schema_info': None,
+        'query_results': None,
+        'saved_prompts': [],
+        'temp_dir': tempfile.mkdtemp(),
+        'current_prompt': '',
+        'processing': False
+    }
+    
+    for key, value in default_values.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
 
-def load_saved_prompts() -> List[Dict]:
-    """Load saved prompts from file"""
+def extract_clean_filename(filename):
+    """Extract clean filename by removing timestamp prefix"""
+    # Remove timestamp pattern like "20250703_044021_"
+    import re
+    # Pattern to match timestamp prefix: YYYYMMDD_HHMMSS_
+    pattern = r'^\d{8}_\d{6}_'
+    clean_name = re.sub(pattern, '', filename)
+    # Remove file extension
+    clean_name = os.path.splitext(clean_name)[0]
+    return clean_name
+
+def save_uploaded_file(uploaded_file) -> Optional[str]:
+    """Save uploaded file and return both paths"""
     try:
-        if os.path.exists('saved_prompts.json'):
-            with open('saved_prompts.json', 'r') as f:
+        # Extract clean filename without timestamp
+        clean_name = extract_clean_filename(uploaded_file.name)
+        st.session_state.clean_file_name = clean_name
+        
+        # Create timestamped filename for storage
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        file_name = f"{timestamp}_{uploaded_file.name}"
+        file_path = os.path.join(st.session_state.temp_dir, file_name)
+        
+        # Save the file
+        with open(file_path, "wb") as f:
+            f.write(uploaded_file.getbuffer())
+        
+        return file_path
+    except Exception as e:
+        st.error(f"Error saving uploaded file: {str(e)}")
+        return None
+
+def load_saved_prompts() -> List[Dict[str, Any]]:
+    """Load saved prompts from local storage"""
+    try:
+        if os.path.exists("saved_prompts.json"):
+            with open("saved_prompts.json", "r") as f:
                 return json.load(f)
     except Exception as e:
-        st.error(f"Error loading saved prompts: {str(e)}")
+        st.warning(f"Could not load saved prompts: {str(e)}")
     return []
 
-def save_prompts_to_file(prompts: List[Dict]):
-    """Save prompts to file"""
+def save_prompts_to_file(prompts: List[Dict[str, Any]]):
+    """Save prompts to local storage"""
     try:
-        with open('saved_prompts.json', 'w') as f:
-            json.dump(prompts, f, indent=2)
+        with open("saved_prompts.json", "w") as f:
+            json.dump(prompts, f, indent=2, default=str)
     except Exception as e:
-        st.error(f"Error saving prompts: {str(e)}")
+        st.warning(f"Could not save prompts: {str(e)}")
 
-def add_to_history(prompt: str, result: str, sql_query: str = None, rating: float = None, error: str = None):
-    """Add prompt and result to history"""
-    history_item = {
-        'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        'prompt': prompt,
-        'result': result,
-        'sql_query': sql_query,
-        'rating': rating,
-        'error': error
-    }
-    
-    st.session_state.prompt_history.insert(0, history_item)
-    # Keep only latest 3 prompts
-    if len(st.session_state.prompt_history) > 3:
-        st.session_state.prompt_history = st.session_state.prompt_history[:3]
-
-def save_prompt(prompt: str, result: str, sql_query: str = None):
-    """Save a prompt to permanent storage"""
-    saved_item = {
-        'id': len(st.session_state.saved_prompts) + 1,
-        'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        'prompt': prompt,
-        'result': result,
-        'sql_query': sql_query,
-        'file_name': st.session_state.uploaded_file_name
-    }
-    
-    st.session_state.saved_prompts.append(saved_item)
-    save_prompts_to_file(st.session_state.saved_prompts)
-    st.success("Prompt saved successfully!")
-
-def get_detailed_schema_info(df: pd.DataFrame) -> str:
-    """Generate detailed schema information with examples"""
-    table_name = os.path.splitext(st.session_state.uploaded_file_name)[0] if st.session_state.uploaded_file_name else "data"
-    
-    schema_info = f"**Table Name:** {table_name}\n\n"
-    schema_info += f"**Total Rows:** {len(df)}\n"
-    schema_info += f"**Total Columns:** {len(df.columns)}\n\n"
-    
-    schema_info += "**Column Details:**\n"
-    for col in df.columns:
-        dtype = str(df[col].dtype)
-        unique_count = df[col].nunique()
-        null_count = df[col].isnull().sum()
+def create_schema_tool(csv_path: str, clean_table_name: str):
+    """Create a schema tool for the given CSV path with clean table name"""
+    class CSVSchemaTool:
+        def __init__(self, csv_path: str, table_name: str):
+            self.csv_path = csv_path
+            self.table_name = table_name
         
-        schema_info += f"- **{col}** ({dtype})\n"
-        schema_info += f"  - Unique values: {unique_count}\n"
-        schema_info += f"  - Null values: {null_count}\n"
+        def _run(self) -> str:
+            return get_csv_schema_with_clean_name(self.csv_path, self.table_name)
         
-        # Add sample values
-        if dtype in ['object', 'string']:
-            sample_values = df[col].dropna().unique()[:3]
-            schema_info += f"  - Sample values: {', '.join(map(str, sample_values))}\n"
-        elif dtype in ['int64', 'float64', 'int32', 'float32']:
-            min_val, max_val = df[col].min(), df[col].max()
-            schema_info += f"  - Range: {min_val} to {max_val}\n"
-        schema_info += "\n"
+        def __call__(self) -> str:
+            return self._run()
     
-    return schema_info
+    return CSVSchemaTool(csv_path, clean_table_name)
 
-def process_csv_upload(uploaded_file):
-    """Process uploaded CSV file with enhanced schema analysis"""
+def get_csv_schema_with_clean_name(csv_path: str, table_name: str) -> str:
+    """Get schema information from CSV file with custom table name"""
     try:
-        # Create temporary file
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.csv') as tmp_file:
-            tmp_file.write(uploaded_file.getvalue())
-            tmp_file_path = tmp_file.name
+        df = pd.read_csv(csv_path)
         
-        # Update session state
-        st.session_state.uploaded_file_path = tmp_file_path
-        st.session_state.uploaded_file_name = uploaded_file.name
-        
-        # Load and analyze the data
-        df = pd.read_csv(tmp_file_path)
-        st.session_state.current_dataframe = df
-        
-        # Generate detailed schema
-        detailed_schema = get_detailed_schema_info(df)
-        st.session_state.detailed_schema = detailed_schema
-        
-        # Basic schema info for display
-        table_name = os.path.splitext(uploaded_file.name)[0]
-        schema_info = f"**Table:** {table_name}\n"
-        schema_info += f"**Columns:** {', '.join(df.columns)}\n"
-        schema_info += f"**Shape:** {df.shape[0]} rows, {df.shape[1]} columns\n"
-        
-        st.session_state.schema_info = schema_info
-        
-        return df, schema_info, tmp_file_path
-        
+        schema_info = f"Table: {table_name}\n"
+        schema_info += f"Columns: {', '.join(df.columns)}\n"
+        schema_info += f"Shape: {df.shape}\n"
+        schema_info += f"Data types:\n{df.dtypes.to_string()}\n\n"
+        schema_info += f"Sample data (first 3 rows):\n{df.head(3).to_string(index=False)}"
+        return schema_info
     except Exception as e:
-        st.error(f"Error processing CSV file: {str(e)}")
-        return None, None, None
+        return f"Error reading CSV: {str(e)}"
 
-def execute_sql_with_retry(user_query: str, csv_file_path: str, max_attempts: int = 3) -> tuple:
-    """Execute SQL query with automatic retry on errors"""
-    attempt = 0
-    last_error = None
-    query_history = []
-    
-    while attempt < max_attempts:
-        try:
-            attempt += 1
-            st.info(f"🔄 Attempt {attempt}/{max_attempts}: Generating SQL query...")
+def extract_sql_from_results(results_text: str) -> str:
+    """Extract SQL query from results text with improved parsing"""
+    try:
+        lines = results_text.split('\n')
+        
+        # Look for different query patterns
+        sql_query = None
+        
+        # Method 1: Look for "Query:" followed by SQL
+        for i, line in enumerate(lines):
+            line_stripped = line.strip()
             
-            with st.spinner("Generating and executing SQL query..."):
-                # Create enhanced schema tool
-                def enhanced_schema_tool():
-                    if st.session_state.detailed_schema:
-                        return st.session_state.detailed_schema
-                    return get_csv_schema._run(csv_file_path)
-                
-                # Add error context if this is a retry attempt
-                query_with_context = user_query
-                if attempt > 1 and last_error:
-                    query_with_context += f"\n\nPREVIOUS ERROR TO FIX: {last_error}"
-                    query_with_context += f"\nPREVIOUS FAILED QUERIES: {', '.join(query_history)}"
-                    query_with_context += "\nPlease generate a corrected SQL query that fixes these issues."
-                
-                # Run the SQL agent
-                result = run_sql_agent(
-                    user_query=query_with_context,
-                    schema_tool=enhanced_schema_tool,
-                    csv_file_path=csv_file_path,
-                    max_retries=2,  # Internal retries for rating
-                    execution_threshold=0.7,  # Lower threshold for faster execution
-                    return_full_state=True
-                )
-                
-                # Extract information from result
-                final_result = result.get("result", "No result available")
-                error = result.get("error")
-                query_attempts = result.get("query_attempts", [])
-                best_query = result.get("best_query")
-                
-                # Get the executed query
-                if best_query:
-                    sql_query = best_query.get("query", "No SQL query generated")
-                    rating = best_query.get("rating", 0.0)
-                else:
-                    sql_query = result.get("sql_query", "No SQL query generated")
-                    rating = result.get("query_rating", 0.0)
-                
-                # Test execute the query to catch runtime errors
-                if sql_query and sql_query != "No SQL query generated":
-                    test_result = test_execute_query(sql_query, csv_file_path)
-                    if "Error" in test_result:
-                        last_error = test_result
-                        query_history.append(sql_query)
-                        if attempt < max_attempts:
-                            st.warning(f"⚠️ Attempt {attempt} failed: {test_result}")
-                            continue
-                        else:
-                            return f"❌ All attempts failed. Last error: {test_result}", sql_query, rating
-                    else:
-                        # Success - return the working query and result
-                        success_msg = f"✅ Query successful on attempt {attempt}!\n\n{test_result}"
-                        return success_msg, sql_query, rating
-                
-                # If no query generated, treat as error
-                if not sql_query or sql_query == "No SQL query generated":
-                    last_error = "No valid SQL query was generated"
-                    if attempt < max_attempts:
-                        st.warning(f"⚠️ Attempt {attempt} failed: No query generated")
-                        continue
-                    else:
-                        return "❌ Failed to generate a valid SQL query", None, 0.0
-                
-                # Return the result if no errors
-                return final_result, sql_query, rating
-                
-        except Exception as e:
-            last_error = str(e)
-            if attempt < max_attempts:
-                st.warning(f"⚠️ Attempt {attempt} failed with error: {str(e)}")
-            else:
-                error_msg = f"❌ All attempts failed. Final error: {str(e)}\n"
-                error_msg += f"Traceback: {traceback.format_exc()}"
-                return error_msg, None, 0.0
-    
-    return f"❌ Maximum attempts ({max_attempts}) reached. Last error: {last_error}", None, 0.0
-
-def test_execute_query(sql_query: str, csv_file_path: str) -> str:
-    """Test execute a SQL query to catch errors"""
-    try:
-        # Load CSV data
-        df = pd.read_csv(csv_file_path)
-        table_name = os.path.splitext(os.path.basename(csv_file_path))[0]
+            # Pattern: "Query:" followed by SQL
+            if line_stripped.startswith("Query:"):
+                sql_part = line_stripped.replace("Query:", "").strip()
+                if sql_part:
+                    sql_query = sql_part
+                    # Check if query continues on next lines until we hit "Results:" or another section
+                    for j in range(i+1, len(lines)):
+                        next_line = lines[j].strip()
+                        if not next_line or next_line.startswith("===") or next_line.startswith("Results:") or next_line.startswith("Total Attempts:"):
+                            break
+                        sql_query += " " + next_line
+                    break
         
-        # Create locals dictionary
-        locals_dict = {table_name: df}
+        # Method 2: Look for "Best Query" pattern
+        if not sql_query:
+            in_best_query_section = False
+            for i, line in enumerate(lines):
+                line_stripped = line.strip()
+                
+                if "Best Query (Rating:" in line_stripped:
+                    in_best_query_section = True
+                    continue
+                elif in_best_query_section and line_stripped:
+                    if line_stripped.lower().startswith(('select', 'insert', 'update', 'delete', 'with')):
+                        sql_query = line_stripped
+                        # Continue collecting query lines
+                        for j in range(i+1, len(lines)):
+                            next_line = lines[j].strip()
+                            if not next_line or next_line.startswith("===") or next_line.startswith("Feedback:"):
+                                break
+                            if not next_line.lower().startswith(('select', 'insert', 'update', 'delete', 'with')):
+                                sql_query += " " + next_line
+                            else:
+                                break
+                        break
+                elif in_best_query_section and line_stripped.startswith("==="):
+                    in_best_query_section = False
         
-        # Execute query
-        result_df = ps.sqldf(sql_query, locals_dict)
+        # Method 3: Look for any SQL statement in the results
+        if not sql_query:
+            for line in lines:
+                line_stripped = line.strip()
+                if line_stripped.lower().startswith(('select', 'insert', 'update', 'delete', 'with')):
+                    sql_query = line_stripped
+                    break
         
-        # Format results
-        if len(result_df) == 0:
-            return "✅ Query executed successfully but returned no results."
-        else:
-            result_str = f"✅ Query executed successfully!\n\n"
-            result_str += f"**Results Preview:**\n{result_df.head(10).to_string(index=False)}\n\n"
-            result_str += f"📊 **Summary:** {len(result_df)} rows returned\n"
-            result_str += f"📋 **Columns:** {', '.join(result_df.columns)}"
-            return result_str
+        # Method 4: Extract from "Attempt X" sections
+        if not sql_query:
+            attempt_queries = []
+            in_attempt_section = False
+            current_query = ""
             
+            for i, line in enumerate(lines):
+                line_stripped = line.strip()
+                
+                if line_stripped.startswith("Attempt") and "Rating:" in line_stripped:
+                    in_attempt_section = True
+                    if current_query:
+                        attempt_queries.append(current_query.strip())
+                        current_query = ""
+                    continue
+                elif line_stripped.startswith("Query:") and in_attempt_section:
+                    query_part = line_stripped.replace("Query:", "").strip()
+                    current_query = query_part
+                    # Continue collecting query lines
+                    for j in range(i+1, len(lines)):
+                        next_line = lines[j].strip()
+                        if not next_line or next_line.startswith("Feedback:") or next_line.startswith("Attempt"):
+                            break
+                        current_query += " " + next_line
+                elif line_stripped.startswith("Feedback:") and in_attempt_section:
+                    if current_query:
+                        attempt_queries.append(current_query.strip())
+                        current_query = ""
+                    in_attempt_section = False
+            
+            # Add the last query if exists
+            if current_query:
+                attempt_queries.append(current_query.strip())
+            
+            # Use the last (most recent) attempt query
+            if attempt_queries:
+                sql_query = attempt_queries[-1]
+        
+        # Clean up the extracted query
+        if sql_query:
+            # Remove common prefixes/suffixes
+            sql_query = sql_query.strip()
+            
+            # Remove markdown code blocks if present
+            if sql_query.startswith("```sql"):
+                sql_query = sql_query.replace("```sql", "").replace("```", "").strip()
+            elif sql_query.startswith("```"):
+                sql_query = sql_query.replace("```", "").strip()
+            
+            # Remove trailing semicolon and whitespace
+            sql_query = sql_query.rstrip(';').strip()
+            
+            # Ensure it's a valid SQL statement
+            if sql_query and any(sql_query.lower().startswith(keyword) for keyword in ['select', 'insert', 'update', 'delete', 'with']):
+                return sql_query
+        
+        return ""
     except Exception as e:
-        return f"Error: {str(e)}"
-
-def render_copy_button(text: str, button_text: str = "📋 Copy"):
-    """Render a copy button for text"""
-    button_id = f"copy_btn_{hash(text) % 10000}"
-    
-    st.markdown(f"""
-    <div class="copy-button">
-        <button onclick="navigator.clipboard.writeText(`{text.replace('`', '\\`')}`).then(() => {{
-            const btn = document.getElementById('{button_id}');
-            const originalText = btn.innerHTML;
-            btn.innerHTML = '✅ Copied!';
-            setTimeout(() => {{ btn.innerHTML = originalText; }}, 2000);
-        }})" 
-        id="{button_id}"
-        style="
-            background-color: #007bff;
-            color: white;
-            border: none;
-            padding: 5px 10px;
-            border-radius: 4px;
-            cursor: pointer;
-            font-size: 12px;
-        ">
-            {button_text}
-        </button>
-    </div>
-    """, unsafe_allow_html=True)
+        st.warning(f"Error extracting SQL: {str(e)}")
+        return ""
 
 def main():
-    """Main Streamlit application"""
+    """Main application function"""
     initialize_session_state()
     
-    # Header
-    st.title("🔍 Enhanced SQL Query Generator")
-    st.markdown("Upload your CSV data and ask questions in natural language with improved error handling!")
+    # Load saved prompts
+    if not st.session_state.saved_prompts:
+        st.session_state.saved_prompts = load_saved_prompts()
     
-    # Sidebar for file upload and schema info
+    # Header
+    st.title("🔍 SQL Query Generator")
+    st.write("Transform your natural language questions into SQL queries!")
+    st.divider()
+    
+    # Sidebar for file upload and settings
     with st.sidebar:
-        st.header("📁 Data Upload")
+        st.header("📁 File Upload")
         
         uploaded_file = st.file_uploader(
             "Choose a CSV file",
             type=['csv'],
-            help="Upload a CSV file to analyze"
+            help="Upload a CSV file to generate SQL queries"
         )
         
         if uploaded_file is not None:
-            if (st.session_state.uploaded_file_name != uploaded_file.name or 
-                st.session_state.uploaded_file_path is None):
-                
-                df, schema_info, file_path = process_csv_upload(uploaded_file)
-                
-                if df is not None:
-                    st.success(f"✅ File '{uploaded_file.name}' uploaded successfully!")
+            if not st.session_state.processing:
+                file_path = save_uploaded_file(uploaded_file)
+                if file_path:
+                    st.session_state.uploaded_file_path = file_path
+                    st.session_state.uploaded_file_name = uploaded_file.name
+                    st.success("File uploaded successfully!")
                     
-                    # Show data preview
-                    st.subheader("📊 Data Preview")
-                    st.dataframe(df.head(), use_container_width=True)
-                    
-                    # Show basic schema info
-                    st.subheader("📋 Schema Summary")
-                    st.markdown(schema_info)
-                    
-                    # Show detailed schema in expander
-                    with st.expander("🔍 Detailed Schema Information"):
-                        st.markdown(st.session_state.detailed_schema)
+                    # Display file info
+                    try:
+                        df = pd.read_csv(file_path)
+                        st.info(f"**File Info:**\n- Rows: {len(df):,}\n- Columns: {len(df.columns)}\n- Table Name: {st.session_state.clean_file_name}")
+                        
+                        # Show column names
+                        with st.expander("Column Names"):
+                            for i, col in enumerate(df.columns, 1):
+                                st.write(f"{i}. {col}")
+                                
+                    except Exception as e:
+                        st.warning(f"Could not read file info: {str(e)}")
         
-        elif st.session_state.uploaded_file_path:
-            st.info("📄 Current file: " + st.session_state.uploaded_file_name)
-            if st.session_state.schema_info:
-                st.subheader("📋 Schema Summary")
-                st.markdown(st.session_state.schema_info)
-                
-                with st.expander("🔍 Detailed Schema"):
-                    st.markdown(st.session_state.detailed_schema)
+        st.divider()
+        
+        # Settings
+        st.header("⚙️ Settings")
+        
+        max_retries = st.slider("Max Retries", min_value=1, max_value=5, value=3)
+        execution_threshold = st.slider("Execution Threshold", min_value=0.1, max_value=1.0, value=0.8, step=0.1)
+        
+        # Saved prompts
+        if st.session_state.saved_prompts:
+            st.divider()
+            st.header("💾 Saved Prompts")
+            
+            selected_prompt = st.selectbox(
+                "Load saved prompt",
+                options=[""] + [p["name"] for p in st.session_state.saved_prompts]
+            )
+            
+            if selected_prompt:
+                prompt_data = next((p for p in st.session_state.saved_prompts if p["name"] == selected_prompt), None)
+                if prompt_data:
+                    st.text_area("Preview:", value=prompt_data["query"], height=100, disabled=True)
+                    if st.button("Load This Prompt"):
+                        st.session_state.current_prompt = prompt_data["query"]
+                        st.success("Prompt loaded!")
+                        st.rerun()
     
     # Main content area
     col1, col2 = st.columns([2, 1])
     
     with col1:
-        st.header("💬 Ask Your Question")
+        st.header("💬 Enter Your Query")
+        
+        # Display current file info
+        if st.session_state.uploaded_file_name:
+            st.info(f"📄 **Current File:** {st.session_state.uploaded_file_name}")
+            st.info(f"🏷️ **Table Name:** {st.session_state.clean_file_name}")
+        else:
+            st.warning("Please upload a CSV file first")
         
         # Query input
+        default_query = st.session_state.get('current_prompt', '')
+        
         user_query = st.text_area(
-            "Enter your question in natural language:",
-            placeholder="e.g., Show me the top 5 customers by sales amount, or Calculate the average age of employees",
-            height=100
+            "Enter your question about the data:",
+            value=default_query,
+            height=120,
+            placeholder="e.g., Show me the top 5 customers by total sales amount"
         )
         
-        # Advanced options
-        with st.expander("⚙️ Advanced Options"):
-            max_attempts = st.slider("Maximum retry attempts", 1, 5, 3)
-            show_attempts = st.checkbox("Show all query attempts", value=False)
+        # Clear current prompt after using it
+        if 'current_prompt' in st.session_state and st.session_state.current_prompt:
+            st.session_state.current_prompt = ''
         
-        # Execute button
-        col_btn1, col_btn2 = st.columns([1, 1])
+        # Action buttons
+        col_btn1, col_btn2, col_btn3 = st.columns([1, 1, 1])
         
         with col_btn1:
-            execute_btn = st.button(
-                "🚀 Generate & Execute SQL",
-                type="primary",
-                disabled=not (user_query and st.session_state.uploaded_file_path)
-            )
+            generate_clicked = st.button("🚀 Generate SQL", type="primary", use_container_width=True)
         
         with col_btn2:
-            if st.session_state.query_results:
-                save_btn = st.button("💾 Save This Query", type="secondary")
-                if save_btn and st.session_state.query_results:
-                    last_history = st.session_state.prompt_history[0] if st.session_state.prompt_history else None
-                    if last_history:
-                        save_prompt(
-                            last_history['prompt'],
-                            last_history['result'],
-                            last_history.get('sql_query')
-                        )
+            if user_query.strip():
+                save_name = st.text_input("Save as:", placeholder="My Query")
+                if st.button("💾 Save Prompt", use_container_width=True) and save_name:
+                    new_prompt = {
+                        "name": save_name,
+                        "query": user_query,
+                        "saved_at": datetime.now().isoformat()
+                    }
+                    st.session_state.saved_prompts.append(new_prompt)
+                    save_prompts_to_file(st.session_state.saved_prompts)
+                    st.success("Prompt saved!")
+                    st.rerun()
         
-        # Execute query with retry logic
-        if execute_btn and user_query and st.session_state.uploaded_file_path:
-            result, sql_query, rating = execute_sql_with_retry(
-                user_query, 
-                st.session_state.uploaded_file_path,
-                max_attempts
-            )
-            
-            # Add to history
-            error = "Error" in result if result else None
-            add_to_history(user_query, result, sql_query, rating, error)
-            st.session_state.query_results = result
-            
-            # Display results
-            st.subheader("📊 Query Results")
-            
-            # Show SQL query with copy button
-            if sql_query and sql_query != "No SQL query generated":
-                st.subheader(f"🔧 Generated SQL Query")
-                if rating:
-                    st.info(f"⭐ Query Rating: {rating:.2f}/1.0")
-                
-                # Display SQL in code block
-                st.code(sql_query, language='sql')
-                
-                # Add copy button
-                render_copy_button(sql_query, "📋 Copy SQL Query")
-            
-            # Show results
-            st.subheader("📈 Execution Results")
-            if "❌" in result or "Error" in result:
-                st.error(result)
-            else:
-                st.success("Query executed successfully!")
-                st.markdown(result)
+        with col_btn3:
+            if st.button("🗑️ Clear", use_container_width=True):
+                st.session_state.query_results = None
+                st.session_state.schema_info = None
+                st.session_state.prompt_history = []
+                st.success("Cleared!")
+                st.rerun()
     
     with col2:
-        st.header("📚 Query History")
+        # Display additional info
+        if st.session_state.schema_info:
+            st.header("📋 Schema Info")
+            with st.expander("View Schema"):
+                st.text(st.session_state.schema_info)
+    
+    # Process query generation
+    if generate_clicked:
+        if not user_query.strip():
+            st.error("Please enter a query!")
+            return
         
-        # Recent prompts (latest 3)
-        if st.session_state.prompt_history:
-            st.subheader("🕐 Recent Queries")
-            
-            for i, item in enumerate(st.session_state.prompt_history):
-                status_icon = "❌" if item.get('error') else "✅"
-                with st.expander(f"{status_icon} Query {i+1} - {item['timestamp']}", expanded=(i==0)):
-                    st.markdown(f"**Question:** {item['prompt']}")
-                    
-                    if item.get('sql_query') and item['sql_query'] != "No SQL query generated":
-                        st.markdown("**SQL Query:**")
-                        st.code(item['sql_query'], language='sql')
-                        render_copy_button(item['sql_query'], "📋 Copy")
-                        
-                        if item.get('rating') is not None:
-                            st.markdown(f"**Rating:** {item['rating']:.2f}/1.0")
-                    
-                    st.markdown("**Result:**")
-                    result_preview = item['result'][:300] + "..." if len(item['result']) > 300 else item['result']
-                    
-                    if item.get('error') or "❌" in item['result']:
-                        st.error(result_preview)
-                    else:
-                        st.success(result_preview)
-        else:
-            st.info("No recent queries yet. Execute a query to see history here.")
+        if not st.session_state.uploaded_file_path or not st.session_state.clean_file_name:
+            st.error("Please upload a CSV file first!")
+            return
+        
+        # Set processing flag
+        st.session_state.processing = True
+        
+        # Show progress
+        with st.spinner("Processing your query..."):
+            try:
+                # Create schema tool with clean table name
+                schema_tool = create_schema_tool(st.session_state.uploaded_file_path, st.session_state.clean_file_name)
+                
+                # Get schema info for display
+                st.session_state.schema_info = schema_tool._run()
+                
+                # Run SQL agent
+                results = run_sql_agent(
+                    user_query=user_query,
+                    schema_tool=schema_tool,
+                    csv_file_path=st.session_state.uploaded_file_path,
+                    clean_table_name=st.session_state.clean_file_name,
+                    max_retries=max_retries,
+                    execution_threshold=execution_threshold,
+                    return_full_state=False
+                )
+                
+                st.session_state.query_results = results
+                
+                # Add to history
+                history_entry = {
+                    "timestamp": datetime.now().isoformat(),
+                    "query": user_query,
+                    "file": st.session_state.uploaded_file_name,
+                    "table_name": st.session_state.clean_file_name,
+                    "results": results
+                }
+                st.session_state.prompt_history.append(history_entry)
+                
+                st.success("SQL query generated successfully!")
+                
+            except Exception as e:
+                st.error(f"Error generating SQL: {str(e)}")
+                st.error(f"Debug info: {traceback.format_exc()}")
+            finally:
+                st.session_state.processing = False
     
-    # Saved prompts section
-    st.header("💾 Saved Queries")
-    
-    if st.session_state.saved_prompts:
-        # Create tabs for better organization
-        tab1, tab2 = st.tabs(["📋 All Saved Queries", "🗑️ Manage Queries"])
+    # Display results
+    if st.session_state.query_results:
+        st.divider()
+        st.header("📊 Results")
+        
+        # Create tabs for different views
+        tab1, tab2, tab3 = st.tabs(["🎯 Query Results", "📋 Schema Info", "📈 Analysis"])
         
         with tab1:
-            for i, item in enumerate(reversed(st.session_state.saved_prompts)):
-                with st.expander(f"Saved Query #{item['id']} - {item['timestamp']}"):
-                    st.markdown(f"**File:** {item.get('file_name', 'Unknown')}")
-                    st.markdown(f"**Question:** {item['prompt']}")
-                    
-                    if item.get('sql_query') and item['sql_query'] != "No SQL query generated":
-                        st.markdown("**SQL Query:**")
-                        st.code(item['sql_query'], language='sql')
-                        render_copy_button(item['sql_query'], "📋 Copy Query")
-                    
-                    st.markdown("**Result:**")
-                    if "Error" in item['result'] or "❌" in item['result']:
-                        st.error(item['result'])
-                    else:
-                        st.text(item['result'])
+            st.text(st.session_state.query_results)
+            
+            # Extract SQL query for copying with improved parsing
+            sql_query = extract_sql_from_results(st.session_state.query_results)
+            if sql_query:
+                st.subheader("📝 Generated SQL Query")
+                print(sql_query)
+                st.code(sql_query, language="sql")
+                
+                # Add copy button functionality
+                st.write("**Copy the SQL query above to use in your database client**")
+            else:
+                st.warning("Could not extract SQL query from results. Please check the full results above.")
         
         with tab2:
-            st.subheader("🗑️ Delete Saved Queries")
+            if st.session_state.schema_info:
+                st.text(st.session_state.schema_info)
+        
+        with tab3:
+            # Parse and display analysis
+            results_text = st.session_state.query_results
             
-            if st.button("Clear All Saved Queries", type="secondary"):
-                if st.session_state.saved_prompts:
-                    st.session_state.saved_prompts = []
-                    save_prompts_to_file([])
-                    st.success("All saved queries cleared!")
-                    st.rerun()
+            if "Total Attempts:" in results_text:
+                lines = results_text.split('\n')
+                attempts = 0
+                ratings = []
+                
+                for line in lines:
+                    if line.startswith("Total Attempts:"):
+                        attempts = int(line.split(":")[1].strip())
+                    elif "Rating:" in line and ")" in line:
+                        try:
+                            rating_part = line.split("Rating: ")[1].split(")")[0]
+                            ratings.append(float(rating_part))
+                        except:
+                            pass
+                
+                col_m1, col_m2, col_m3 = st.columns(3)
+                with col_m1:
+                    st.metric("Total Attempts", attempts)
+                with col_m2:
+                    if ratings:
+                        st.metric("Best Rating", f"{max(ratings):.2f}")
+                with col_m3:
+                    if ratings:
+                        st.metric("Avg Rating", f"{sum(ratings)/len(ratings):.2f}")
             
-            st.markdown(f"**Total saved queries:** {len(st.session_state.saved_prompts)}")
-    else:
-        st.info("No saved queries yet. Execute and save a query to see it here.")
+            st.text(results_text)
     
-    # Footer with tips
-    st.markdown("---")
-    st.markdown(
-        """
-        <div style='text-align: center; color: #666;'>
-            <p>🔍 Enhanced SQL Query Generator | 
-            💡 <strong>Tips:</strong> Be specific in your questions | 
-            🔄 Auto-retry on errors | 
-            📋 Copy queries to clipboard</p>
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
-    
-    # Help section
-    with st.expander("❓ Help & Tips"):
-        st.markdown("""
-        ### 🎯 **How to get better results:**
+    # Query history - FIXED: No nested expanders
+    if st.session_state.prompt_history:
+        st.divider()
+        st.header("📚 Query History")
         
-        1. **Be specific:** Instead of "show data", try "show top 10 customers by sales"
-        2. **Use column names:** Check the schema and use exact column names in your questions
-        3. **Ask for calculations:** "calculate average", "find maximum", "count records"
-        4. **Filter data:** "show records where age > 25", "find customers from specific city"
-        
-        ### 🔧 **Features:**
-        - **Auto-retry:** Failed queries are automatically regenerated with error context
-        - **Copy queries:** Click the copy button to copy SQL queries to clipboard  
-        - **Detailed schema:** Expanded schema shows column types and sample values
-        - **Query history:** Recent queries are saved for reference
-        
-        ### 💡 **Example questions:**
-        - "Show me the top 5 products by sales amount"
-        - "Calculate the average age of customers by city"
-        - "Find all orders placed in the last month"
-        - "Count how many employees work in each department"
-        """)
+        with st.expander(f"Recent Queries ({len(st.session_state.prompt_history)})", expanded=False):
+            for i, entry in enumerate(reversed(st.session_state.prompt_history[-5:])):
+                st.write(f"**Query {len(st.session_state.prompt_history)-i}:** {entry['query']}")
+                st.write(f"**File:** {entry['file']} (Table: {entry['table_name']})")
+                st.write(f"**Time:** {entry['timestamp'][:19].replace('T', ' ')}")
+                
+                # Use a toggle button instead of nested expander
+                show_results_key = f"show_results_{len(st.session_state.prompt_history)-i}"
+                if show_results_key not in st.session_state:
+                    st.session_state[show_results_key] = False
+                
+                if st.button(f"🔍 {'Hide' if st.session_state[show_results_key] else 'Show'} Results", 
+                           key=f"toggle_{len(st.session_state.prompt_history)-i}"):
+                    st.session_state[show_results_key] = not st.session_state[show_results_key]
+                
+                # Show results if toggled on
+                if st.session_state[show_results_key]:
+                    st.text(entry['results'])
+                    
+                    # Extract and show SQL from history entry
+                    historical_sql = extract_sql_from_results(entry['results'])
+                    if historical_sql:
+                        st.code(historical_sql, language="sql")
+                
+                if i < len(st.session_state.prompt_history[-5:]) - 1:
+                    st.divider()
 
 if __name__ == "__main__":
     main()
