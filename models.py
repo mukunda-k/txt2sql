@@ -13,7 +13,7 @@ class Qwen:
             model_name: Model name to use
         """
         if api_key is None:
-            api_key = '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'
+            api_key = 'openrouter_api_key_placeholder'  # Replace with your actual OpenRouter API key
         
         self.client = ChatOpenAI(
             model=model_name,
@@ -50,7 +50,7 @@ class Qwen:
             model_name: Model name to use
         """
         if api_key is None:
-            api_key = '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'
+            api_key = 'openrouter_api_key_placeholder'  # Replace with your actual OpenRouter API key
         
         self.client = ChatOpenAI(
             model=model_name,
