@@ -2,43 +2,6 @@ from typing import TypedDict, List, Dict, Any, Optional
 from langchain_openai import ChatOpenAI
 
 class Qwen:
-    """Qwen 2.5 client wrapper for SQL query generation"""
-    
-    def __init__(self, api_key: Optional[str] = None, model_name: str = "qwen/qwen-2.5-72b-instruct:free"):
-        """
-        Initialize Qwen 2.5 client
-        
-        Args:
-            api_key: OpenRouter API key (optional, uses hardcoded key if not provided)
-            model_name: Model name to use
-        """
-        if api_key is None:
-            api_key = 'openrouter_api_key_placeholder'  # Replace with your actual OpenRouter API key
-        
-        self.client = ChatOpenAI(
-            model=model_name,
-            api_key=api_key,
-            base_url="https://openrouter.ai/api/v1",
-            temperature=0.1
-        )
-    
-    def invoke(self, messages: List[Any]) -> Any:
-        """
-        Invoke the model with given messages
-        
-        Args:
-            messages: List of messages to send to the model
-            
-        Returns:
-            Model response
-        """
-        return self.client.invoke(messages)
-
-
-from typing import TypedDict, List, Dict, Any, Optional
-from langchain_openai import ChatOpenAI
-
-class Qwen:
     """Qwen client wrapper for SQL query generation"""
     
     def __init__(self, api_key: Optional[str] = None, model_name: str = "qwen/qwen-2.5-coder-32b-instruct"):
